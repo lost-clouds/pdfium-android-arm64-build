@@ -1,0 +1,160 @@
+name: Build LlamaParse PDFium Android ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdfium_branch:
+        description: PDFium source branch to build
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    name: Build PDFium for Android arm64-v8a
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      DEPOT_TOOLS_UPDATE: "0"
+      PDFIUM_BRANCH: ${{ inputs.pdfium_branch }}
+
+    steps:
+      - name: Reclaim runner disk space
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Disk before cleanup:"
+          df -h /
+
+          # The build downloads its own Android NDK, so the preinstalled SDK
+          # and unrelated language toolchains can be removed safely.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/share/powershell \
+            /usr/local/share/chromium \
+            /opt/hostedtoolcache/CodeQL
+
+          echo "Disk after cleanup:"
+          df -h /
+
+          available_kb=$(df --output=avail -k / | tail -n 1 | tr -d ' ')
+          if (( available_kb < 26214400 )); then
+            echo "ERROR: less than 25 GiB free on runner; PDFium checkout/build may run out of disk." >&2
+            exit 1
+          fi
+
+      - name: Check external source access
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git ls-remote https://chromium.googlesource.com/chromium/tools/depot_tools.git HEAD
+          git ls-remote https://pdfium.googlesource.com/pdfium.git HEAD
+          curl -fIL --retry 2 --connect-timeout 20 --max-time 90 \
+            https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+
+      - name: Fetch LlamaParse PDFium build scripts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch llamaparse \
+            https://github.com/run-llama/pdfium-binaries.git pdfium-binaries
+          echo "Build scripts commit: $(git -C pdfium-binaries rev-parse HEAD)" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Limit Ninja parallelism
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("pdfium-binaries/steps/06-build.sh")
+          text = path.read_text()
+          old = 'ninja -C "$BUILD_DIR" pdfium'
+          new = 'ninja -j2 -C "$BUILD_DIR" pdfium'
+          if old not in text:
+              raise SystemExit(f"Expected Ninja command not found in {path}; inspect upstream script changes")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          grep -n ninja pdfium-binaries/steps/06-build.sh
+
+      - name: Build Android ARM64 PDFium
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd pdfium-binaries
+          ./build.sh -b "$PDFIUM_BRANCH" android arm64
+
+      - name: Verify library and LlamaParse symbols
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd pdfium-binaries
+
+          LIB="staging/lib/libpdfium.so"
+          LLVM_NM="pdfium/third_party/llvm-build/Release+Asserts/bin/llvm-nm"
+          test -s "$LIB"
+          test -x "$LLVM_NM"
+
+          "$LLVM_NM" -D --defined-only "$LIB" | awk '{print $NF}' > /tmp/pdfium.exports
+
+          required_symbols=(
+            FPDFAnnot_GetObjNum
+            FPDFFont_GetCharGlyphIndex
+            FPDFFont_GetCharGlyphName
+            FPDFFont_GetEncoding
+            FPDFFont_GetGlyphPathFromCharCode
+            FPDFFont_GetGlyphWidthFromCharCode
+            FPDFFont_GetType
+            FPDFFont_HasToUnicode
+            FPDFText_GetCharCode
+            FPDF_StructElement_GetChildObjNum
+          )
+
+          failed=0
+          for symbol in "${required_symbols[@]}"; do
+            if grep -Fxq "$symbol" /tmp/pdfium.exports; then
+              echo "[OK] $symbol"
+            else
+              echo "[MISSING] $symbol" >&2
+              failed=1
+            fi
+          done
+          if (( failed != 0 )); then
+            echo "PDFium was built, but one or more required LiteParse symbols are missing." >&2
+            exit 1
+          fi
+
+          file "$LIB"
+          if ! readelf -h "$LIB" | grep -q 'Machine:.*AArch64'; then
+            echo "ERROR: output is not an AArch64 ELF library" >&2
+            exit 1
+          fi
+          readelf -h "$LIB" | grep -E 'Class:|Machine:'
+          sha256sum "$LIB"
+
+          {
+            echo "## PDFium Android ARM64 build"
+            echo "- PDFium source branch: $PDFIUM_BRANCH"
+            echo "- LlamaParse build scripts commit: $(git rev-parse HEAD)"
+            echo "- PDFium source commit: $(git -C pdfium rev-parse HEAD)"
+            echo "- Required LiteParse symbols: all 10 present"
+            echo "- SHA256: $(sha256sum "$LIB" | awk '{print $1}')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload PDFium build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdfium-android-arm64-llamaparse
+          path: |
+            pdfium-binaries/staging/lib/libpdfium.so
+            pdfium-binaries/staging/pdfium-android-arm64.tgz
+            pdfium-binaries/staging/args.gn
+          if-no-files-found: error
+          retention-days: 7
+
