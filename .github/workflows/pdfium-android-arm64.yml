@@ -132,6 +132,27 @@ jobs:
           replacement = "\n".join(replacement_lines)
           patch_script.write_text(script_text.replace(needle, replacement, 1))
           print("Updated public-header patch compatibility handling")
+
+          # gclient sync may finish before depot_tools has installed its
+          # hermetic Python/CIPD bootstrap. GN's depot_tools wrapper requires
+          # python3_bin_reldir.txt, so bootstrap explicitly before `gn gen`.
+          configure = repo / "steps/05-configure.sh"
+          configure_text = configure.read_text()
+          marker = 'gn gen "$BUILD"'
+          if configure_text.count(marker) != 1:
+              raise SystemExit("Expected exactly one gn gen invocation in steps/05-configure.sh")
+          bootstrap = """DEPOT_TOOLS_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")/../depot_tools\" && pwd)\"
+          if [ ! -s \"$DEPOT_TOOLS_DIR/python3_bin_reldir.txt\" ]; then
+            echo \"Bootstrapping depot_tools Python/CIPD tools...\"
+            \"$DEPOT_TOOLS_DIR/ensure_bootstrap\"
+          fi
+          if [ ! -s \"$DEPOT_TOOLS_DIR/python3_bin_reldir.txt\" ]; then
+            echo \"ERROR: depot_tools bootstrap did not create python3_bin_reldir.txt\" >&2
+            exit 1
+          fi
+          """
+          configure.write_text(configure_text.replace(marker, bootstrap + marker, 1))
+          print("Added explicit depot_tools bootstrap before GN generation")
           PY
 
       - name: Build Android ARM64 PDFium
