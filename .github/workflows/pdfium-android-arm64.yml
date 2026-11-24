@@ -83,6 +83,57 @@ jobs:
           PY
           grep -n ninja pdfium-binaries/steps/06-build.sh
 
+      - name: Adapt public-header patch to current PDFium main
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          repo = Path("pdfium-binaries")
+          patch_file = repo / "patches/public_headers.patch"
+          patch_text = patch_file.read_text()
+
+          # PDFium main added public/fpdf_ppo.h in November 2026. That makes
+          # the older whole-file fpdf_deleters.h hunk fail. Rewrite includes
+          # generically after checkout and keep the other patch hunks.
+          start = patch_text.find("diff --git a/public/cpp/fpdf_deleters.h ")
+          end = patch_text.find("diff --git a/public/cpp/fpdf_scopers.h ", start + 1)
+          if start < 0 or end < 0 or end <= start:
+              raise SystemExit("Could not isolate fpdf_deleters.h diff in public_headers.patch")
+          patch_file.write_text(patch_text[:start] + patch_text[end:])
+
+          patch_script = repo / "steps/03-patch.sh"
+          script_text = patch_script.read_text()
+          needle = 'apply_patch "$PATCHES/public_headers.patch"'
+          if script_text.count(needle) != 1:
+              raise SystemExit("Expected exactly one public_headers.patch application")
+
+          replacement_lines = [
+              "# Convert all public API includes in fpdf_deleters.h to paths relative to public/cpp.",
+              "# This also handles headers added by newer PDFium main.",
+              "python3 - <<'PYTHON'",
+              "from pathlib import Path",
+              "import re",
+              "header = Path('public/cpp/fpdf_deleters.h')",
+              "content = header.read_text()",
+              "content, count = re.subn(",
+              "    r'(?m)^(\\s*#include\\s+)\"public/([^\"]+)\"',",
+              "    r'\\1\"../\\2\"',",
+              "    content,",
+              ")",
+              "if count < 9:",
+              "    raise SystemExit(f'Expected at least 9 public includes; rewrote {count}')",
+              "header.write_text(content)",
+              "print(f'Rewrote {count} public includes in {header}')",
+              "PYTHON",
+              'apply_patch "$PATCHES/public_headers.patch"',
+          ]
+          replacement = "\n".join(replacement_lines)
+          patch_script.write_text(script_text.replace(needle, replacement, 1))
+          print("Updated public-header patch compatibility handling")
+          PY
+
       - name: Build Android ARM64 PDFium
         shell: bash
         run: |
@@ -153,8 +204,7 @@ jobs:
           name: pdfium-android-arm64-llamaparse
           path: |
             pdfium-binaries/staging/lib/libpdfium.so
-            pdfium-binaries/staging/pdfium-android-arm64.tgz
+            pdfium-binaries/pdfium-android-arm64.tgz
             pdfium-binaries/staging/args.gn
           if-no-files-found: error
           retention-days: 7
-
