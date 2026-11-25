@@ -94,9 +94,9 @@ jobs:
           patch_file = repo / "patches/public_headers.patch"
           patch_text = patch_file.read_text()
 
-          # PDFium main added public/fpdf_ppo.h in November 2026. That makes
-          # the older whole-file fpdf_deleters.h hunk fail. Rewrite includes
-          # generically after checkout and keep the other patch hunks.
+          # The fpdf_deleters.h include list can change between PDFium
+          # revisions. Rewrite its public/ includes after checkout instead
+          # of relying on a fixed whole-file patch hunk.
           start = patch_text.find("diff --git a/public/cpp/fpdf_deleters.h ")
           end = patch_text.find("diff --git a/public/cpp/fpdf_scopers.h ", start + 1)
           if start < 0 or end < 0 or end <= start:
@@ -141,7 +141,20 @@ jobs:
           marker = 'gn gen "$BUILD"'
           if configure_text.count(marker) != 1:
               raise SystemExit("Expected exactly one gn gen invocation in steps/05-configure.sh")
-          bootstrap = """DEPOT_TOOLS_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")/../depot_tools\" && pwd)\"
+          bootstrap = """# steps/01-install.sh clones depot_tools beside the pdfium checkout.
+          # 00-environment.sh makes SOURCE an absolute path to that checkout.
+          case \"$SOURCE\" in
+            /*) ;;
+            *)
+              echo \"ERROR: expected absolute PDFium SOURCE path, got: $SOURCE\" >&2
+              exit 1
+              ;;
+          esac
+          DEPOT_TOOLS_DIR=\"$(cd \"$SOURCE/../depot_tools\" && pwd)\"
+          if [ ! -x \"$DEPOT_TOOLS_DIR/ensure_bootstrap\" ]; then
+            echo \"ERROR: depot_tools ensure_bootstrap not found at $DEPOT_TOOLS_DIR\" >&2
+            exit 1
+          fi
           if [ ! -s \"$DEPOT_TOOLS_DIR/python3_bin_reldir.txt\" ]; then
             echo \"Bootstrapping depot_tools Python/CIPD tools...\"
             \"$DEPOT_TOOLS_DIR/ensure_bootstrap\"
